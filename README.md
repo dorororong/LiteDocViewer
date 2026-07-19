@@ -31,6 +31,20 @@ GitHub Releases에서 `LiteDocViewer-Setup-x64.exe`를 내려받아 실행합니
 artifacts\Installer\LiteDocViewer-Setup-x64.exe
 ```
 
+## 사용 전 주의사항
+
+현재 버전은 개인이 직접 만들었거나 출처를 확실히 아는 문서를 보는 용도로 사용하세요.
+
+- HTML과 Markdown 문서에 포함된 JavaScript가 실행될 수 있습니다. 인터넷이나 모르는 사람에게 받은 `.html`, `.htm`, `.md`, `.markdown` 파일은 열지 마세요.
+- 악의적인 문서는 같은 폴더의 다른 파일을 읽으려고 하거나 인터넷 연결, 외부 프로그램 실행 등을 시도할 수 있습니다. 중요한 파일과 열어 볼 문서를 같은 폴더에 두지 않는 것이 좋습니다.
+- 설치 파일과 앱은 아직 코드 서명되지 않았습니다. Windows SmartScreen이나 사용자 계정 컨트롤에서 `알 수 없는 게시자` 경고가 표시될 수 있습니다.
+- 설치 프로그램은 필요한 경우 Microsoft 공식 서버에서 .NET 8 Desktop Runtime과 WebView2 Runtime을 내려받아 설치하므로 인터넷 연결과 관리자 권한이 필요할 수 있습니다.
+- 현재 배포 파일은 x64용이며 Windows 10 1809 이상 또는 Windows 11을 대상으로 합니다. 회사 보안 프로그램, 프록시, 오프라인 환경에서는 설치가 실패할 수 있습니다.
+- Release의 `LiteDocViewer.exe`만 직접 실행하면 .NET 8 Desktop Runtime이 없는 PC에서는 실행되지 않습니다. 일반 사용자는 `LiteDocViewer-Setup-x64.exe`를 이용하세요.
+- 앱을 제거해도 `%LocalAppData%\LiteDocViewer`에 설정과 WebView2 캐시가 남을 수 있습니다.
+
+현재 설치 프로그램은 서비스, 예약 작업, 시작 프로그램 또는 방화벽 규칙을 추가하지 않습니다. 다만 위의 문서 실행 관련 보안 제한은 향후 버전에서 개선할 예정입니다.
+
 ## 개발 환경에서 실행
 
 필요 조건: Windows 10/11, .NET 8 SDK, WebView2 Runtime
