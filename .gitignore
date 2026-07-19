@@ -1,0 +1,8 @@
+bin/
+obj/
+artifacts/
+.vs/
+.dotnet/
+.dotnet-incomplete/
+*.user
+*.suo

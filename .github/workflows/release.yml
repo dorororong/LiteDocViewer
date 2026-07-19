@@ -1,0 +1,100 @@
+name: Build and release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version without the v prefix
+        required: true
+        default: 1.0.0
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install .NET 8 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Resolve version
+        id: version
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+            $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          } else {
+            $version = '${{ inputs.version }}'
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Publish small framework-dependent app
+        shell: pwsh
+        run: |
+          dotnet publish .\LiteDocViewer.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained false `
+            -p:PublishSingleFile=true `
+            -p:DebugType=None `
+            -p:DebugSymbols=false `
+            -p:Version=${{ steps.version.outputs.version }} `
+            -o .\artifacts\App
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & '${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe' `
+            '/DAppVersion=${{ steps.version.outputs.version }}' `
+            '.\installer\LiteDocViewer.iss'
+
+      - name: Create checksums
+        shell: pwsh
+        run: |
+          $files = @(
+            '.\artifacts\App\LiteDocViewer.exe',
+            '.\artifacts\Installer\LiteDocViewer-Setup-x64.exe'
+          )
+          $lines = foreach ($file in $files) {
+            $hash = (Get-FileHash $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $([IO.Path]::GetFileName($file))"
+          }
+          $lines | Set-Content '.\artifacts\SHA256SUMS.txt' -Encoding ascii
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiteDocViewer-${{ steps.version.outputs.version }}
+          path: |
+            artifacts/App/LiteDocViewer.exe
+            artifacts/Installer/LiteDocViewer-Setup-x64.exe
+            artifacts/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            '.\artifacts\Installer\LiteDocViewer-Setup-x64.exe' `
+            '.\artifacts\App\LiteDocViewer.exe' `
+            '.\artifacts\SHA256SUMS.txt' `
+            --title "LiteDoc Viewer $env:GITHUB_REF_NAME" `
+            --generate-notes
