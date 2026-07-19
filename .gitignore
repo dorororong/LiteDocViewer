@@ -6,3 +6,5 @@ artifacts/
 .dotnet-incomplete/
 *.user
 *.suo
+icon_img.png
+assets/icon_chroma.png
