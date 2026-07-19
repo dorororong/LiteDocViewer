@@ -55,7 +55,7 @@ artifacts\App\LiteDocViewer.exe
 artifacts\Installer\LiteDocViewer-Setup-x64.exe
 ```
 
-앱은 framework-dependent 방식이므로 작지만 .NET 8 Desktop Runtime이 필요합니다. 설치 프로그램이 이 의존성을 자동으로 처리합니다.
+앱은 framework-dependent 방식이므로 작지만 .NET 8 Desktop Runtime이 필요합니다. 설치 프로그램이 이 의존성을 자동으로 처리합니다. WebView2 네이티브 로더는 단일 EXE에 포함되어 설치 후 별도 DLL 없이 실행됩니다.
 
 ## GitHub Releases 자동 배포
 
