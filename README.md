@@ -1,17 +1,22 @@
 # LiteDoc Viewer
 
-Windows용 경량 로컬 Markdown/HTML 문서 브라우저입니다. WPF, WebView2, Markdig로 만들어졌습니다.
+Windows용 경량 로컬 Markdown, HTML, TXT, JSON 문서 브라우저입니다. WPF, WebView2, Markdig로 만들어졌습니다.
 
 ## 주요 기능
 
-- `.md`, `.markdown`, `.html`, `.htm`만 표시하는 폴더 트리
+- 탐색기에서 `.md`, `.markdown`, `.html`, `.htm`, `.txt`, `.json` 파일을 LiteDoc Viewer로 열면 해당 문서만 표시
+- **문서 폴더 열기**로 현재 문서의 폴더를 표시하고, 하위 폴더를 펼칠 때 그 안의 문서 목록을 불러오기
 - GitHub 계열 스타일의 Markdown 렌더링과 상대 이미지 경로 지원
 - JavaScript, CSS, 이미지 등 상대 리소스가 동작하는 HTML 미리보기
-- 파일 변경 감지 후 자동 새로고침
-- 밝은/어두운 모드와 마지막 폴더 기억
+- TXT는 줄바꿈을 유지해 표시하고, JSON은 읽기 쉽도록 들여쓰기해서 표시
+- 문서는 기본 읽기 모드로 열립니다. **편집**을 눌러 원문을 수정하고 **저장** 또는 `Ctrl+S`를 누르면 같은 파일에 저장한 뒤 미리보기로 돌아갑니다. UTF-8과 BOM이 있는 유니코드 파일을 편집할 수 있습니다.
+- 보고 있는 문서의 변경 감지 후 자동 새로고침
+- 오른쪽 위에서 밝게, 어둡게, Nord, Catppuccin Latte, Catppuccin Mocha를 선택하고 마지막 테마와 폴더를 기억
 - `Ctrl+O` 폴더 열기, `F5` 새로고침
 - 외부 링크는 Windows 기본 브라우저에서 열기
 - 팝업과 다운로드를 앱 내부에서 차단
+
+추가 테마는 [Nord](https://www.nordtheme.com/docs/colors-and-palettes/)와 [Catppuccin](https://catppuccin.com/palette/)의 색상 팔레트를 참고했습니다. HTML 문서의 스타일은 문서 자체의 CSS를 따릅니다.
 
 ## 일반 사용자용 설치
 

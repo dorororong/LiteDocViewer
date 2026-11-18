@@ -6,6 +6,7 @@ namespace LiteDocViewer.Services;
 public sealed class AppSettings
 {
     public string? LastFolder { get; set; }
+    public string? Theme { get; set; }
     public bool IsDarkTheme { get; set; }
 }
 

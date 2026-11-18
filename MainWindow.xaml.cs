@@ -1,14 +1,16 @@
 using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
-using System.Net;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Text.Json;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
 using LiteDocViewer.Models;
 using LiteDocViewer.Services;
-using Markdig;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Win32;
 
@@ -17,35 +19,42 @@ namespace LiteDocViewer;
 public partial class MainWindow : Window
 {
     private const string VirtualHostName = "local-preview.test";
-    private static readonly HashSet<string> SupportedExtensions =
-        new(StringComparer.OrdinalIgnoreCase) { ".md", ".markdown", ".html", ".htm" };
+    private const string DocumentHostName = "document-preview.test";
 
     private readonly ObservableCollection<FileTreeItem> _treeItems = [];
-    private readonly MarkdownPipeline _markdownPipeline = new MarkdownPipelineBuilder()
-        .UseAdvancedExtensions()
-        .Build();
     private readonly AppSettings _settings;
     private readonly DispatcherTimer _refreshTimer;
+    private readonly string? _startupFile;
+    private readonly HashSet<string> _changedFolders = new(StringComparer.OrdinalIgnoreCase);
     private FileSystemWatcher? _watcher;
-    private string? _rootFolder;
+    private FileTreeItem? _folderRoot;
+    private string? _previewFolder;
     private string? _currentDocumentPath;
+    private string? _changedDocumentPath;
+    private int _previewMappingVersion;
     private bool _webViewReady;
-    private bool _isInternalMarkdownNavigation;
+    private ViewerTheme _theme;
+    private int _themeChangeVersion;
 
-    public MainWindow()
+    public MainWindow(string? startupFile)
     {
         InitializeComponent();
+        _startupFile = startupFile;
         FileTree.ItemsSource = _treeItems;
         _settings = AppSettingsService.Load();
+        _theme = ViewerTheme.All.FirstOrDefault(theme => theme.Id == _settings.Theme) ??
+            ViewerTheme.All[_settings.IsDarkTheme ? 1 : 0];
         _refreshTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(350) };
         _refreshTimer.Tick += RefreshTimer_Tick;
 
+        InitializeThemeMenu();
         ApplyTheme();
         Loaded += MainWindow_Loaded;
     }
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
     {
+        Loaded -= MainWindow_Loaded;
         try
         {
             var webViewDataFolder = Path.Combine(
@@ -63,225 +72,328 @@ public partial class MainWindow : Window
             Preview.CoreWebView2.NavigationCompleted += CoreWebView2_NavigationCompleted;
             Preview.CoreWebView2.NewWindowRequested += CoreWebView2_NewWindowRequested;
             Preview.CoreWebView2.DownloadStarting += (_, args) => args.Cancel = true;
+            Preview.CoreWebView2.AddWebResourceRequestedFilter($"https://{DocumentHostName}/*",
+                CoreWebView2WebResourceContext.Document, CoreWebView2WebResourceRequestSourceKinds.All);
+            Preview.CoreWebView2.WebResourceRequested += DocumentPreview_Requested;
             UpdateWebViewTheme();
-
-            if (!string.IsNullOrWhiteSpace(_settings.LastFolder) && Directory.Exists(_settings.LastFolder))
-                OpenFolder(_settings.LastFolder);
         }
         catch (Exception ex)
         {
             ShowError("WebView2를 초기화할 수 없습니다. WebView2 Runtime 설치 상태를 확인하세요.", ex);
+            return;
         }
+
+        OpenFolderButton.IsEnabled = true;
+        if (_startupFile is not null)
+            OpenSingleDocument(_startupFile);
+        else if (Directory.Exists(_settings.LastFolder))
+            OpenFolder(_settings.LastFolder!);
     }
 
     private void OpenFolder_Click(object sender, RoutedEventArgs e)
     {
+        if (!_webViewReady)
+            return;
+
         var dialog = new OpenFolderDialog
         {
-            Title = "Markdown/HTML 문서 폴더 선택",
+            Title = "문서 폴더 선택",
             Multiselect = false,
-            InitialDirectory = Directory.Exists(_rootFolder) ? _rootFolder : null
+            InitialDirectory = _folderRoot?.FullPath ?? _previewFolder
         };
 
         if (dialog.ShowDialog(this) == true)
             OpenFolder(dialog.FolderName);
     }
 
+    private void OpenDocumentFolder_Click(object sender, RoutedEventArgs e)
+    {
+        if (_currentDocumentPath is not null && Path.GetDirectoryName(_currentDocumentPath) is { } folder)
+            OpenFolder(folder);
+    }
+
+    private void OpenSingleDocument(string file)
+    {
+        string path;
+        try
+        {
+            path = Path.GetFullPath(file);
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or IOException)
+        {
+            StatusText.Text = "파일 경로를 확인하세요.";
+            return;
+        }
+
+        if (!DocumentPreview.IsSupported(path) || !File.Exists(path))
+        {
+            StatusText.Text = "지원하는 문서 파일을 찾을 수 없습니다.";
+            return;
+        }
+
+        SetPreviewFolder(Path.GetDirectoryName(path)!);
+        _treeItems.Add(new FileTreeItem { Name = Path.GetFileName(path), FullPath = path });
+        DisplayDocument(path);
+    }
+
     private void OpenFolder(string folder)
     {
-        var normalizedFolder = Path.GetFullPath(folder);
-        _rootFolder = normalizedFolder;
+        var normalizedFolder = Path.TrimEndingDirectorySeparator(Path.GetFullPath(folder));
+        if (_folderRoot?.FullPath.Equals(normalizedFolder, StringComparison.OrdinalIgnoreCase) == true)
+        {
+            _ = RefreshExpandedFoldersAsync(_folderRoot);
+            return;
+        }
+
+        var keepDocument = _currentDocumentPath is not null &&
+            IsInsideFolder(_currentDocumentPath, normalizedFolder);
+        if (!keepDocument && !TryCloseEditor(refreshPreview: false))
+            return;
+
+        var changePreviewFolder = !keepDocument || !IsInsidePreviewFolder(normalizedFolder);
+        if (changePreviewFolder)
+            SetPreviewFolder(normalizedFolder);
+
+        if (!keepDocument)
+        {
+            SetCurrentDocument(null);
+            PathText.Text = normalizedFolder;
+            StatusText.Text = "준비";
+            EmptyState.Visibility = Visibility.Visible;
+            if (Preview.Source is not null)
+                Preview.CoreWebView2.Navigate("about:blank");
+        }
+
         _settings.LastFolder = normalizedFolder;
         AppSettingsService.Save(_settings);
 
-        if (_webViewReady)
-        {
-            Preview.CoreWebView2.ClearVirtualHostNameToFolderMapping(VirtualHostName);
-            Preview.CoreWebView2.SetVirtualHostNameToFolderMapping(
-                VirtualHostName, normalizedFolder, CoreWebView2HostResourceAccessKind.DenyCors);
-        }
+        var root = CreateDirectoryItem(new DirectoryInfo(normalizedFolder), isExpanded: true);
+        _folderRoot = root;
+        StartWatching(_previewFolder!, includeSubdirectories: true);
+        _treeItems.Clear();
+        _treeItems.Add(root);
 
-        BuildTree();
-        StartWatching(normalizedFolder);
-        PathText.Text = normalizedFolder;
-        StatusText.Text = $"{CountDocuments(_treeItems)}개 문서";
+        if (changePreviewFolder && _currentDocumentPath is not null)
+            DisplayDocument(_currentDocumentPath);
     }
 
-    private void BuildTree()
+    private void SetPreviewFolder(string folder)
     {
-        _treeItems.Clear();
-        if (_rootFolder is null || !Directory.Exists(_rootFolder))
+        if (string.Equals(_previewFolder, folder, StringComparison.OrdinalIgnoreCase))
             return;
 
-        var root = BuildDirectoryNode(new DirectoryInfo(_rootFolder), true);
-        if (root is not null)
-            _treeItems.Add(root);
+        Preview.CoreWebView2.ClearVirtualHostNameToFolderMapping(VirtualHostName);
+        Preview.CoreWebView2.SetVirtualHostNameToFolderMapping(
+            VirtualHostName, folder, CoreWebView2HostResourceAccessKind.DenyCors);
+        _previewFolder = folder;
+        ++_previewMappingVersion;
     }
 
-    private static FileTreeItem? BuildDirectoryNode(DirectoryInfo directory, bool isRoot = false)
+    private static FileTreeItem CreateDirectoryItem(DirectoryInfo directory, bool isExpanded = false)
     {
-        var node = new FileTreeItem
+        var item = new FileTreeItem
         {
             Name = directory.Name,
             FullPath = directory.FullName,
             IsDirectory = true,
-            IsExpanded = isRoot
+            IsExpanded = isExpanded
         };
+        item.Children.Add(CreatePlaceholder(directory.FullName, "불러오는 중…"));
+        return item;
+    }
 
+    private static FileTreeItem CreatePlaceholder(string folder, string message) =>
+        new() { Name = message, FullPath = folder, IsPlaceholder = true };
+
+    private static List<FileTreeItem> ReadDirectory(string path) =>
+        new DirectoryInfo(path).EnumerateFileSystemInfos()
+            .Where(entry => entry is DirectoryInfo
+                ? (entry.Attributes & (FileAttributes.Hidden | FileAttributes.System)) == 0
+                : DocumentPreview.IsSupported(entry.Name))
+            .OrderBy(entry => entry is FileInfo)
+            .ThenBy(entry => entry.Name, StringComparer.CurrentCultureIgnoreCase)
+            .Select(entry => entry is DirectoryInfo directory
+                ? CreateDirectoryItem(directory)
+                : new FileTreeItem { Name = entry.Name, FullPath = entry.FullName })
+            .ToList();
+
+    private async void FileTree_Expanded(object sender, RoutedEventArgs e)
+    {
+        if (e.OriginalSource is TreeViewItem { DataContext: FileTreeItem { IsDirectory: true } folder })
+            await LoadDirectoryAsync(folder);
+    }
+
+    private async Task LoadDirectoryAsync(FileTreeItem folder)
+    {
+        var loadVersion = ++folder.LoadVersion;
+        List<FileTreeItem> entries;
         try
         {
-            foreach (var childDirectory in directory.EnumerateDirectories()
-                         .Where(d => (d.Attributes & (FileAttributes.Hidden | FileAttributes.System)) == 0)
-                         .OrderBy(d => d.Name, StringComparer.CurrentCultureIgnoreCase))
-            {
-                var childNode = BuildDirectoryNode(childDirectory);
-                if (childNode is not null)
-                    node.Children.Add(childNode);
-            }
-
-            foreach (var file in directory.EnumerateFiles()
-                         .Where(f => SupportedExtensions.Contains(f.Extension))
-                         .OrderBy(f => f.Name, StringComparer.CurrentCultureIgnoreCase))
-            {
-                node.Children.Add(new FileTreeItem
-                {
-                    Name = file.Name,
-                    FullPath = file.FullName,
-                    IsDirectory = false
-                });
-            }
+            entries = await Task.Run(() => ReadDirectory(folder.FullPath));
+            if (entries.Count == 0)
+                entries.Add(CreatePlaceholder(folder.FullPath, "문서나 하위 폴더가 없습니다."));
         }
-        catch (UnauthorizedAccessException)
+        catch (Exception ex) when (ex is UnauthorizedAccessException or IOException)
         {
-            return null;
-        }
-        catch (IOException)
-        {
-            return null;
+            entries = [CreatePlaceholder(folder.FullPath, "폴더를 읽을 수 없습니다.")];
         }
 
-        return node.Children.Count > 0 || isRoot ? node : null;
-    }
-
-    private async void FileTree_SelectedItemChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
-    {
-        if (e.NewValue is FileTreeItem { IsDirectory: false } item)
-            await DisplayDocumentAsync(item.FullPath);
-    }
-
-    private async Task DisplayDocumentAsync(string path)
-    {
-        if (!_webViewReady || _rootFolder is null || !File.Exists(path) || !IsInsideRoot(path))
+        if (loadVersion != folder.LoadVersion)
             return;
 
+        // Reuse existing items so a refresh preserves the selection and expanded folders.
+        var entriesByKey = entries.ToDictionary(TreeItemKey);
+        var children = folder.Children;
+        for (var i = children.Count - 1; i >= 0; --i)
+        {
+            if (!entriesByKey.ContainsKey(TreeItemKey(children[i])))
+                children.RemoveAt(i);
+        }
+
+        var existing = children.ToDictionary(TreeItemKey);
+        for (var i = 0; i < entries.Count; ++i)
+        {
+            var entry = entries[i];
+            if (!existing.TryGetValue(TreeItemKey(entry), out var current))
+                children.Insert(i, entry);
+            else if (!ReferenceEquals(children[i], current))
+                children.Move(children.IndexOf(current), i);
+        }
+    }
+
+    private static (string Name, bool IsDirectory, bool IsPlaceholder) TreeItemKey(FileTreeItem item) =>
+        (item.Name, item.IsDirectory, item.IsPlaceholder);
+
+    private void FileTree_SelectedItemChanged(object sender, RoutedPropertyChangedEventArgs<object> e)
+    {
+        if (_restoringTreeSelection || e.NewValue is not FileTreeItem { IsDirectory: false, IsPlaceholder: false } item)
+            return;
+
+        if (_editDocument is not null)
+        {
+            if (string.Equals(_editDocument.Path, item.FullPath, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            if (!TryCloseEditor(refreshPreview: false))
+            {
+                RestoreTreeSelection(e.OldValue as FileTreeItem, item);
+                return;
+            }
+        }
+
+        DisplayDocument(item.FullPath);
+    }
+
+    private void SetCurrentDocument(string? path)
+    {
+        var changed = !string.Equals(_currentDocumentPath, path, StringComparison.OrdinalIgnoreCase);
         _currentDocumentPath = path;
-        PathText.Text = path;
+        OpenDocumentFolderButton.IsEnabled = path is not null;
+        UpdateEditButton();
+        if (path is not null)
+        {
+            PathText.Text = path;
+            if (changed && _folderRoot is null)
+                StartWatching(Path.GetDirectoryName(path)!, includeSubdirectories: false, filter: Path.GetFileName(path));
+        }
+    }
+
+    private void DisplayDocument(string path)
+    {
+        if (_editDocument is not null || !_webViewReady || _previewFolder is null || !DocumentPreview.IsSupported(path) ||
+            !IsInsidePreviewFolder(path) || !File.Exists(path))
+            return;
+
+        SetCurrentDocument(path);
         EmptyState.Visibility = Visibility.Collapsed;
         StatusText.Text = "불러오는 중…";
 
-        var extension = Path.GetExtension(path);
-        if (extension.Equals(".md", StringComparison.OrdinalIgnoreCase) ||
-            extension.Equals(".markdown", StringComparison.OrdinalIgnoreCase))
-        {
-            try
-            {
-                var markdown = await File.ReadAllTextAsync(path);
-                var body = Markdown.ToHtml(markdown, _markdownPipeline);
-                var relativeDirectory = Path.GetRelativePath(_rootFolder, Path.GetDirectoryName(path) ?? _rootFolder)
-                    .Replace('\\', '/');
-                var baseUrl = relativeDirectory == "."
-                    ? $"https://{VirtualHostName}/"
-                    : $"https://{VirtualHostName}/{EncodeRelativePath(relativeDirectory)}/";
-
-                _isInternalMarkdownNavigation = true;
-                Preview.NavigateToString(BuildMarkdownPage(body, baseUrl, Path.GetFileName(path)));
-                _isInternalMarkdownNavigation = false;
-            }
-            catch (Exception ex)
-            {
-                ShowError("Markdown 파일을 읽을 수 없습니다.", ex);
-            }
-        }
-        else
-        {
-            var relativePath = Path.GetRelativePath(_rootFolder, path).Replace('\\', '/');
-            Preview.CoreWebView2.Navigate($"https://{VirtualHostName}/{EncodeRelativePath(relativePath)}");
-        }
+        var relativePath = EncodeRelativePath(Path.GetRelativePath(_previewFolder, path).Replace('\\', '/'));
+        var url = DocumentPreview.IsGenerated(path)
+            ? $"https://{DocumentHostName}/{_previewMappingVersion}/{relativePath}"
+            : $"https://{VirtualHostName}/{relativePath}";
+        Preview.CoreWebView2.Navigate(url);
     }
 
-    private string BuildMarkdownPage(string body, string baseUrl, string title)
+    private async void DocumentPreview_Requested(object? sender, CoreWebView2WebResourceRequestedEventArgs e)
     {
-        var dark = _settings.IsDarkTheme;
-        var background = dark ? "#0d1117" : "#ffffff";
-        var foreground = dark ? "#e6edf3" : "#24292f";
-        var muted = dark ? "#8b949e" : "#57606a";
-        var border = dark ? "#30363d" : "#d0d7de";
-        var code = dark ? "#161b22" : "#f6f8fa";
-        var link = dark ? "#58a6ff" : "#0969da";
+        var environment = Preview.CoreWebView2.Environment;
+        var deferral = e.GetDeferral();
+        try
+        {
+            var status = 404;
+            var contentType = "text/plain";
+            var body = "문서를 읽을 수 없습니다.";
 
-        return $$"""
-            <!doctype html>
-            <html lang="ko">
-            <head>
-              <meta charset="utf-8">
-              <meta name="viewport" content="width=device-width, initial-scale=1">
-              <base href="{{WebUtility.HtmlEncode(baseUrl)}}">
-              <title>{{WebUtility.HtmlEncode(title)}}</title>
-              <style>
-                :root { color-scheme: {{(dark ? "dark" : "light")}}; }
-                * { box-sizing: border-box; }
-                body { max-width: 980px; margin: 0 auto; padding: 36px 48px 80px; background: {{background}}; color: {{foreground}}; font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; overflow-wrap: break-word; }
-                h1, h2 { border-bottom: 1px solid {{border}}; padding-bottom: .3em; }
-                h1, h2, h3, h4, h5, h6 { line-height: 1.25; margin: 1.5em 0 .65em; }
-                h1:first-child { margin-top: 0; }
-                a { color: {{link}}; text-decoration: none; } a:hover { text-decoration: underline; }
-                img, video { max-width: 100%; height: auto; }
-                pre { padding: 16px; overflow: auto; background: {{code}}; border-radius: 6px; }
-                code { font-family: Consolas, "Cascadia Code", monospace; background: {{code}}; border-radius: 4px; padding: .15em .35em; }
-                pre code { padding: 0; background: transparent; }
-                blockquote { margin-left: 0; padding: 0 1em; color: {{muted}}; border-left: .25em solid {{border}}; }
-                table { border-collapse: collapse; display: block; width: max-content; max-width: 100%; overflow: auto; }
-                th, td { padding: 6px 13px; border: 1px solid {{border}}; }
-                tr:nth-child(2n) { background: {{code}}; }
-                hr { height: 1px; border: 0; background: {{border}}; }
-                input[type=checkbox] { margin-right: .5em; }
-                @media (max-width: 700px) { body { padding: 24px 22px 60px; } }
-              </style>
-            </head>
-            <body>{{body}}</body>
-            </html>
-            """;
+            if (_previewFolder is { } previewFolder && TryMapDocumentUrl(e.Request.Uri, out var path))
+            {
+                var theme = _theme;
+                var relativeFolder = Path.GetRelativePath(previewFolder, Path.GetDirectoryName(path)!).Replace('\\', '/');
+                var baseUrl = relativeFolder == "."
+                    ? $"https://{VirtualHostName}/"
+                    : $"https://{VirtualHostName}/{EncodeRelativePath(relativeFolder)}/";
+                try
+                {
+                    var text = await File.ReadAllTextAsync(path);
+                    body = await Task.Run(() => DocumentPreview.BuildPage(path, baseUrl, text, theme));
+                    status = 200;
+                    contentType = "text/html";
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Return a readable error in the preview if a file disappeared or could not be opened.
+                }
+            }
+
+            e.Response = environment.CreateWebResourceResponse(
+                new MemoryStream(Encoding.UTF8.GetBytes(body), writable: false),
+                status, status == 200 ? "OK" : "Not Found",
+                $"Content-Type: {contentType}; charset=utf-8\r\nCache-Control: no-store");
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or COMException)
+        {
+            // The window can close while the document is being read.
+        }
+        finally
+        {
+            deferral.Complete();
+        }
     }
 
     private void CoreWebView2_NavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
     {
-        if (_isInternalMarkdownNavigation || e.Uri == "about:blank" || e.Uri.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+        if (_editDocument is not null)
+        {
+            e.Cancel = true;
             return;
+        }
+
+        if (Uri.TryCreate(e.Uri, UriKind.Absolute, out var uri) &&
+            uri.Host.Equals(DocumentHostName, StringComparison.OrdinalIgnoreCase))
+        {
+            if (TryMapDocumentUrl(e.Uri, out var path))
+                SetCurrentDocument(path);
+            else
+                e.Cancel = true;
+            return;
+        }
 
         if (TryMapLocalUrl(e.Uri, out var localPath))
         {
-            var extension = Path.GetExtension(localPath);
-            if (SupportedExtensions.Contains(extension) &&
-                (extension.Equals(".md", StringComparison.OrdinalIgnoreCase) ||
-                 extension.Equals(".markdown", StringComparison.OrdinalIgnoreCase)))
+            if (!IsInsidePreviewFolder(localPath))
+                e.Cancel = true;
+            else if (DocumentPreview.IsGenerated(localPath))
             {
                 e.Cancel = true;
-                Dispatcher.BeginInvoke(async () => await DisplayDocumentAsync(localPath));
+                Dispatcher.BeginInvoke(() => DisplayDocument(localPath));
             }
-            else if (!IsInsideRoot(localPath))
-            {
-                e.Cancel = true;
-            }
-            else if (SupportedExtensions.Contains(extension))
-            {
-                _currentDocumentPath = localPath;
-                PathText.Text = localPath;
-            }
+            else if (DocumentPreview.IsSupported(localPath))
+                SetCurrentDocument(localPath);
 
             return;
         }
 
-        if (Uri.TryCreate(e.Uri, UriKind.Absolute, out var uri) && uri.Scheme is "http" or "https")
+        if (uri?.Scheme is "http" or "https")
         {
             e.Cancel = true;
             OpenInDefaultBrowser(e.Uri);
@@ -291,49 +403,71 @@ public partial class MainWindow : Window
     private void CoreWebView2_NewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e)
     {
         e.Handled = true;
-        if (TryMapLocalUrl(e.Uri, out var localPath) && IsInsideRoot(localPath))
-            _ = DisplayDocumentAsync(localPath);
+        if (TryMapLocalUrl(e.Uri, out var localPath) && IsInsidePreviewFolder(localPath))
+            DisplayDocument(localPath);
         else
             OpenInDefaultBrowser(e.Uri);
     }
 
-    private void CoreWebView2_NavigationCompleted(object? sender, CoreWebView2NavigationCompletedEventArgs e)
+    private async void CoreWebView2_NavigationCompleted(object? sender, CoreWebView2NavigationCompletedEventArgs e)
     {
         BackButton.IsEnabled = Preview.CanGoBack;
         ForwardButton.IsEnabled = Preview.CanGoForward;
-        StatusText.Text = e.IsSuccess ? "준비" : $"페이지 오류: {e.WebErrorStatus}";
+        if (_editDocument is null)
+            StatusText.Text = e.IsSuccess ? "준비" : $"페이지 오류: {e.WebErrorStatus}";
+        if (e.IsSuccess)
+            await ApplyDocumentThemeAsync(_theme);
+    }
+
+    private bool TryMapDocumentUrl(string url, out string path)
+    {
+        path = string.Empty;
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme != "https" ||
+            !uri.Host.Equals(DocumentHostName, StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        var prefix = $"/{_previewMappingVersion}/";
+        return uri.AbsolutePath.StartsWith(prefix, StringComparison.Ordinal) &&
+               TryMapPreviewPath(uri.AbsolutePath[prefix.Length..], out path) &&
+               IsInsidePreviewFolder(path) && DocumentPreview.IsGenerated(path);
     }
 
     private bool TryMapLocalUrl(string url, out string path)
     {
         path = string.Empty;
-        if (_rootFolder is null || !Uri.TryCreate(url, UriKind.Absolute, out var uri) ||
-            !uri.Host.Equals(VirtualHostName, StringComparison.OrdinalIgnoreCase))
+        return Uri.TryCreate(url, UriKind.Absolute, out var uri) &&
+               uri.Host.Equals(VirtualHostName, StringComparison.OrdinalIgnoreCase) &&
+               TryMapPreviewPath(uri.AbsolutePath.TrimStart('/'), out path);
+    }
+
+    private bool TryMapPreviewPath(string urlPath, out string path)
+    {
+        path = string.Empty;
+        if (_previewFolder is null)
             return false;
 
         try
         {
-            var relative = Uri.UnescapeDataString(uri.AbsolutePath.TrimStart('/'))
-                .Replace('/', Path.DirectorySeparatorChar);
-            path = Path.GetFullPath(Path.Combine(_rootFolder, relative));
+            var relative = Uri.UnescapeDataString(urlPath).Replace('/', Path.DirectorySeparatorChar);
+            path = Path.GetFullPath(Path.Combine(_previewFolder, relative));
             return true;
         }
         catch (Exception)
         {
-            path = string.Empty;
             return false;
         }
     }
 
-    private bool IsInsideRoot(string path)
-    {
-        if (_rootFolder is null)
-            return false;
+    private bool IsInsidePreviewFolder(string path) =>
+        _previewFolder is not null && IsInsideFolder(path, _previewFolder);
 
-        var root = Path.TrimEndingDirectorySeparator(Path.GetFullPath(_rootFolder));
+    private static bool IsInsideFolder(string path, string folder)
+    {
+        var root = Path.TrimEndingDirectorySeparator(folder);
+        var prefix = Path.EndsInDirectorySeparator(root) ? root : root + Path.DirectorySeparatorChar;
         var candidate = Path.GetFullPath(path);
         return candidate.Equals(root, StringComparison.OrdinalIgnoreCase) ||
-               candidate.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+               candidate.StartsWith(prefix, StringComparison.OrdinalIgnoreCase);
     }
 
     private static string EncodeRelativePath(string path) =>
@@ -351,25 +485,57 @@ public partial class MainWindow : Window
         }
     }
 
-    private void StartWatching(string folder)
+    private void StartWatching(string folder, bool includeSubdirectories, string filter = "*")
     {
+        _refreshTimer.Stop();
+        _changedFolders.Clear();
+        _changedDocumentPath = null;
         _watcher?.Dispose();
-        _watcher = new FileSystemWatcher(folder)
+        _watcher = null;
+        try
         {
-            IncludeSubdirectories = true,
-            NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size,
-            EnableRaisingEvents = true
-        };
-        _watcher.Changed += Watcher_Changed;
-        _watcher.Created += Watcher_Changed;
-        _watcher.Deleted += Watcher_Changed;
-        _watcher.Renamed += Watcher_Changed;
+            _watcher = new FileSystemWatcher(folder, filter)
+            {
+                IncludeSubdirectories = includeSubdirectories,
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName | NotifyFilters.LastWrite | NotifyFilters.Size
+            };
+            _watcher.Changed += Watcher_Changed;
+            _watcher.Created += Watcher_Changed;
+            _watcher.Deleted += Watcher_Changed;
+            _watcher.Renamed += Watcher_Changed;
+            _watcher.EnableRaisingEvents = true;
+        }
+        catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException)
+        {
+            _watcher?.Dispose();
+            _watcher = null;
+        }
     }
 
     private void Watcher_Changed(object sender, FileSystemEventArgs e)
     {
         Dispatcher.BeginInvoke(() =>
         {
+            if (!ReferenceEquals(sender, _watcher))
+                return;
+
+            var oldPath = (e as RenamedEventArgs)?.OldFullPath;
+            if (_currentDocumentPath is not null &&
+                (_currentDocumentPath.Equals(e.FullPath, StringComparison.OrdinalIgnoreCase) ||
+                 _currentDocumentPath.Equals(oldPath, StringComparison.OrdinalIgnoreCase)))
+                _changedDocumentPath = _currentDocumentPath;
+
+            if (_folderRoot is not null && e.ChangeType != WatcherChangeTypes.Changed)
+            {
+                if (Path.GetDirectoryName(e.FullPath) is { } folder)
+                    _changedFolders.Add(folder);
+                if (oldPath is not null && Path.GetDirectoryName(oldPath) is { } oldFolder)
+                    _changedFolders.Add(oldFolder);
+            }
+
+            if (_changedDocumentPath is null && _changedFolders.Count == 0)
+                return;
+
             _refreshTimer.Stop();
             _refreshTimer.Start();
         });
@@ -378,78 +544,144 @@ public partial class MainWindow : Window
     private async void RefreshTimer_Tick(object? sender, EventArgs e)
     {
         _refreshTimer.Stop();
-        BuildTree();
-        if (_currentDocumentPath is not null && File.Exists(_currentDocumentPath))
-            await DisplayDocumentAsync(_currentDocumentPath);
+        var changedFolders = _changedFolders.ToHashSet(StringComparer.OrdinalIgnoreCase);
+        _changedFolders.Clear();
+        var changedDocumentPath = _changedDocumentPath;
+        _changedDocumentPath = null;
+
+        var refreshTree = _folderRoot is not null && changedFolders.Count > 0
+            ? RefreshExpandedFoldersAsync(_folderRoot, changedFolders)
+            : Task.CompletedTask;
+        if (changedDocumentPath is not null &&
+            changedDocumentPath.Equals(_currentDocumentPath, StringComparison.OrdinalIgnoreCase))
+            DisplayDocument(changedDocumentPath);
+        await refreshTree;
+    }
+
+    private async Task RefreshExpandedFoldersAsync(FileTreeItem folder, HashSet<string>? changedFolders = null)
+    {
+        if (!folder.IsExpanded)
+            return;
+
+        if (changedFolders is null || changedFolders.Contains(folder.FullPath))
+            await LoadDirectoryAsync(folder);
+
+        if (folder.IsExpanded)
+            await Task.WhenAll(folder.Children.Where(child => child.IsDirectory && child.IsExpanded)
+                .Select(child => RefreshExpandedFoldersAsync(child, changedFolders)));
     }
 
     private async void Refresh_Click(object sender, RoutedEventArgs e) => await RefreshCurrentAsync();
 
     private async Task RefreshCurrentAsync()
     {
-        BuildTree();
-        if (_currentDocumentPath is not null && File.Exists(_currentDocumentPath))
-            await DisplayDocumentAsync(_currentDocumentPath);
-        else if (_webViewReady && Preview.Source is not null)
-            Preview.Reload();
+        var refreshTree = _folderRoot is not null ? RefreshExpandedFoldersAsync(_folderRoot) : Task.CompletedTask;
+        if (_editDocument is null)
+        {
+            if (_currentDocumentPath is not null && File.Exists(_currentDocumentPath))
+                DisplayDocument(_currentDocumentPath);
+            else if (_webViewReady && Preview.Source is not null)
+                Preview.Reload();
+        }
+        await refreshTree;
     }
 
     private void Back_Click(object sender, RoutedEventArgs e)
     {
-        if (Preview.CanGoBack) Preview.GoBack();
+        if (Preview.CanGoBack && TryCloseEditor(refreshPreview: false))
+            Preview.GoBack();
     }
 
     private void Forward_Click(object sender, RoutedEventArgs e)
     {
-        if (Preview.CanGoForward) Preview.GoForward();
+        if (Preview.CanGoForward && TryCloseEditor(refreshPreview: false))
+            Preview.GoForward();
+    }
+
+    private void InitializeThemeMenu()
+    {
+        foreach (var theme in ViewerTheme.All)
+        {
+            var item = new MenuItem { Header = theme.Name, Tag = theme, IsCheckable = true };
+            item.Click += ThemeMenuItem_Click;
+            ThemeButton.ContextMenu.Items.Add(item);
+        }
     }
 
     private void Theme_Click(object sender, RoutedEventArgs e)
     {
-        _settings.IsDarkTheme = !_settings.IsDarkTheme;
-        AppSettingsService.Save(_settings);
+        var menu = ThemeButton.ContextMenu;
+        menu.PlacementTarget = ThemeButton;
+        menu.IsOpen = true;
+    }
+
+    private async void ThemeMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        var selected = (ViewerTheme)((MenuItem)sender).Tag;
+        var version = ++_themeChangeVersion;
+        _theme = selected;
+        if (_editDocument is null)
+            await ApplyDocumentThemeAsync(selected);
+        if (version != _themeChangeVersion)
+            return;
+
         ApplyTheme();
         UpdateWebViewTheme();
-        if (_currentDocumentPath is not null && File.Exists(_currentDocumentPath) &&
-            (Path.GetExtension(_currentDocumentPath).Equals(".md", StringComparison.OrdinalIgnoreCase) ||
-             Path.GetExtension(_currentDocumentPath).Equals(".markdown", StringComparison.OrdinalIgnoreCase)))
-            _ = DisplayDocumentAsync(_currentDocumentPath);
+        _settings.Theme = selected.Id;
+        _settings.IsDarkTheme = selected.IsDark;
+        AppSettingsService.Save(_settings);
     }
 
     private void ApplyTheme()
     {
-        var dark = _settings.IsDarkTheme;
-        SetBrush("WindowBackgroundBrush", dark ? "#0D1117" : "#F7F8FA");
-        SetBrush("PanelBackgroundBrush", dark ? "#161B22" : "#FFFFFF");
-        SetBrush("ToolbarBackgroundBrush", dark ? "#161B22" : "#FFFFFF");
-        SetBrush("BorderBrush", dark ? "#30363D" : "#E1E4E8");
-        SetBrush("PrimaryTextBrush", dark ? "#E6EDF3" : "#24292F");
-        SetBrush("SecondaryTextBrush", dark ? "#8B949E" : "#6E7781");
-        SetBrush("AccentBrush", dark ? "#58A6FF" : "#0969DA");
-        SetBrush("HoverBrush", dark ? "#21262D" : "#F0F3F6");
-        ThemeIcon.Text = dark ? "\uE708" : "\uE706";
-        Preview.DefaultBackgroundColor = dark ? System.Drawing.Color.FromArgb(13, 17, 23) : System.Drawing.Color.White;
+        var palette = _theme.CreateResources();
+        Resources = palette;
+        ThemeButton.ContextMenu.Resources = palette;
+        ThemeName.Text = _theme.Name;
+        foreach (MenuItem item in ThemeButton.ContextMenu.Items)
+            item.IsChecked = ReferenceEquals(item.Tag, _theme);
+
+        var background = (Color)ColorConverter.ConvertFromString(_theme.Page);
+        Preview.DefaultBackgroundColor = System.Drawing.Color.FromArgb(background.R, background.G, background.B);
+    }
+
+    private async Task ApplyDocumentThemeAsync(ViewerTheme theme)
+    {
+        if (!_webViewReady || Preview.Source is not { } uri || uri.Host != DocumentHostName)
+            return;
+
+        try
+        {
+            var css = JsonSerializer.Serialize(theme.PreviewCss);
+            await Preview.CoreWebView2.ExecuteScriptAsync($$"""
+                (() => {
+                    const style = document.getElementById('litedoc-theme');
+                    if (style && style.textContent !== {{css}}) style.textContent = {{css}};
+                })();
+                """);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or COMException)
+        {
+            // Navigation or window closing may interrupt the script.
+        }
     }
 
     private void UpdateWebViewTheme()
     {
         if (_webViewReady)
-            Preview.CoreWebView2.Profile.PreferredColorScheme = _settings.IsDarkTheme
+            Preview.CoreWebView2.Profile.PreferredColorScheme = _theme.IsDark
                 ? CoreWebView2PreferredColorScheme.Dark
                 : CoreWebView2PreferredColorScheme.Light;
     }
 
-    private static void SetBrush(string key, string color) =>
-        CurrentApp.Resources[key] = new SolidColorBrush((Color)ColorConverter.ConvertFromString(color));
-
-    private static Application CurrentApp => Application.Current;
-
-    private static int CountDocuments(IEnumerable<FileTreeItem> items) =>
-        items.Sum(item => item.IsDirectory ? CountDocuments(item.Children) : 1);
-
     private void Window_PreviewKeyDown(object sender, KeyEventArgs e)
     {
-        if (e.Key == Key.O && Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
+        if (e.Key == Key.S && Keyboard.Modifiers == ModifierKeys.Control && _editDocument is not null)
+        {
+            SaveEdit_Click(sender, e);
+            e.Handled = true;
+        }
+        else if (e.Key == Key.O && Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
         {
             OpenFolder_Click(sender, e);
             e.Handled = true;
@@ -463,8 +695,17 @@ public partial class MainWindow : Window
 
     private void Window_Closing(object? sender, System.ComponentModel.CancelEventArgs e)
     {
+        if (!TryCloseEditor(refreshPreview: false))
+        {
+            e.Cancel = true;
+            return;
+        }
+
+        _closingWindow = true;
+        ++_themeChangeVersion;
+        _refreshTimer.Stop();
         _watcher?.Dispose();
-        AppSettingsService.Save(_settings);
+        _watcher = null;
     }
 
     private void ShowError(string message, Exception exception)

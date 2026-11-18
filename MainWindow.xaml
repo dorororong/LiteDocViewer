@@ -20,12 +20,15 @@
                 BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1">
             <DockPanel Margin="12,8">
                 <StackPanel Orientation="Horizontal" DockPanel.Dock="Left">
-                    <Button Click="OpenFolder_Click" ToolTip="폴더 열기 (Ctrl+O)">
+                    <Button x:Name="OpenFolderButton" Click="OpenFolder_Click" IsEnabled="False"
+                            ToolTip="폴더 열기 (Ctrl+O)">
                         <StackPanel Orientation="Horizontal">
                             <TextBlock FontFamily="Segoe Fluent Icons" Text="&#xE838;" Margin="0,0,7,0" />
                             <TextBlock Text="폴더 열기" />
                         </StackPanel>
                     </Button>
+                    <Button x:Name="OpenDocumentFolderButton" Click="OpenDocumentFolder_Click" IsEnabled="False"
+                            Content="문서 폴더 열기" ToolTip="현재 문서가 들어 있는 폴더를 문서 탐색기에 표시" />
                     <Button x:Name="BackButton" Click="Back_Click" IsEnabled="False" ToolTip="이전 페이지">
                         <TextBlock FontFamily="Segoe Fluent Icons" Text="&#xE72B;" />
                     </Button>
@@ -35,11 +38,28 @@
                     <Button Click="Refresh_Click" ToolTip="새로고침 (F5)">
                         <TextBlock FontFamily="Segoe Fluent Icons" Text="&#xE72C;" />
                     </Button>
+                    <Button x:Name="EditButton" Click="EditDocument_Click" IsEnabled="False"
+                            Content="편집" ToolTip="현재 문서의 원문 편집" />
                 </StackPanel>
 
                 <Button x:Name="ThemeButton" DockPanel.Dock="Right" Click="Theme_Click" Margin="6,0,0,0"
-                        ToolTip="밝은/어두운 모드 전환">
-                    <TextBlock x:Name="ThemeIcon" FontFamily="Segoe Fluent Icons" Text="&#xE706;" />
+                        ToolTip="테마 선택" AutomationProperties.Name="테마 선택">
+                    <Button.ContextMenu>
+                        <ContextMenu Placement="Bottom" Background="{DynamicResource PanelBackgroundBrush}"
+                                     Foreground="{DynamicResource PrimaryTextBrush}"
+                                     BorderBrush="{DynamicResource BorderBrush}">
+                            <ContextMenu.ItemContainerStyle>
+                                <Style TargetType="MenuItem">
+                                    <Setter Property="Foreground" Value="{DynamicResource PrimaryTextBrush}" />
+                                </Style>
+                            </ContextMenu.ItemContainerStyle>
+                        </ContextMenu>
+                    </Button.ContextMenu>
+                    <StackPanel Orientation="Horizontal">
+                        <TextBlock FontFamily="Segoe Fluent Icons" Text="&#xE790;" Margin="0,0,7,0" />
+                        <TextBlock x:Name="ThemeName" />
+                        <TextBlock FontFamily="Segoe Fluent Icons" Text="&#xE70D;" Margin="8,0,0,0" FontSize="10" />
+                    </StackPanel>
                 </Button>
 
                 <Border Background="{DynamicResource WindowBackgroundBrush}" CornerRadius="5"
@@ -65,12 +85,21 @@
                                Foreground="{DynamicResource SecondaryTextBrush}" Margin="14,13,10,9" />
                     <TreeView x:Name="FileTree" Background="Transparent" BorderThickness="0" Padding="6,0"
                               Foreground="{DynamicResource PrimaryTextBrush}"
+                              VirtualizingStackPanel.IsVirtualizing="True"
+                              VirtualizingStackPanel.VirtualizationMode="Recycling"
+                              TreeViewItem.Expanded="FileTree_Expanded"
                               SelectedItemChanged="FileTree_SelectedItemChanged">
                         <TreeView.Resources>
                             <Style TargetType="TreeViewItem">
                                 <Setter Property="IsExpanded" Value="{Binding IsExpanded, Mode=TwoWay}" />
+                                <Setter Property="Foreground" Value="{DynamicResource PrimaryTextBrush}" />
                                 <Setter Property="Padding" Value="3" />
                                 <Setter Property="Margin" Value="0,1" />
+                                <Style.Triggers>
+                                    <DataTrigger Binding="{Binding IsPlaceholder}" Value="True">
+                                        <Setter Property="IsEnabled" Value="False" />
+                                    </DataTrigger>
+                                </Style.Triggers>
                             </Style>
                         </TreeView.Resources>
                         <TreeView.ItemTemplate>
@@ -78,7 +107,8 @@
                                 <StackPanel Orientation="Horizontal">
                                     <TextBlock Text="{Binding Icon}" FontFamily="Segoe Fluent Icons"
                                                Foreground="{DynamicResource AccentBrush}" Width="20" VerticalAlignment="Center" />
-                                    <TextBlock Text="{Binding Name}" VerticalAlignment="Center" />
+                                    <TextBlock Text="{Binding Name}" Foreground="{DynamicResource PrimaryTextBrush}"
+                                               VerticalAlignment="Center" />
                                 </StackPanel>
                             </HierarchicalDataTemplate>
                         </TreeView.ItemTemplate>
@@ -92,10 +122,34 @@
             <Border Grid.Column="2" Background="{DynamicResource PanelBackgroundBrush}">
                 <Grid>
                     <wv2:WebView2 x:Name="Preview" DefaultBackgroundColor="White" />
+                    <DockPanel x:Name="EditorPanel" Visibility="Collapsed"
+                               Background="{DynamicResource WindowBackgroundBrush}">
+                        <Border DockPanel.Dock="Top" Background="{DynamicResource ToolbarBackgroundBrush}"
+                                BorderBrush="{DynamicResource BorderBrush}" BorderThickness="0,0,0,1" Padding="14,8">
+                            <DockPanel>
+                                <StackPanel Orientation="Horizontal" DockPanel.Dock="Right">
+                                    <Button x:Name="SaveEditButton" Click="SaveEdit_Click" IsEnabled="False"
+                                            Content="저장" ToolTip="저장하고 미리보기로 돌아가기 (Ctrl+S)" />
+                                    <Button x:Name="CloseEditButton" Click="CloseEditor_Click" Content="편집 닫기" />
+                                </StackPanel>
+                                <TextBlock Text="원문 편집" FontWeight="SemiBold" VerticalAlignment="Center"
+                                           Foreground="{DynamicResource PrimaryTextBrush}" />
+                            </DockPanel>
+                        </Border>
+                        <TextBox x:Name="SourceEditor" BorderThickness="0" Padding="14,10"
+                                 Background="{DynamicResource WindowBackgroundBrush}"
+                                 Foreground="{DynamicResource PrimaryTextBrush}"
+                                 CaretBrush="{DynamicResource PrimaryTextBrush}"
+                                 SelectionBrush="{DynamicResource AccentBrush}"
+                                 FontFamily="Cascadia Mono, Consolas" FontSize="14"
+                                 AcceptsReturn="True" AcceptsTab="True" TextWrapping="Wrap"
+                                 VerticalScrollBarVisibility="Auto" TextChanged="SourceEditor_TextChanged"
+                                 AutomationProperties.Name="문서 원문" />
+                    </DockPanel>
                     <StackPanel x:Name="EmptyState" HorizontalAlignment="Center" VerticalAlignment="Center">
                         <TextBlock Text="&#xE8A5;" FontFamily="Segoe Fluent Icons" FontSize="46"
                                    Foreground="{DynamicResource SecondaryTextBrush}" HorizontalAlignment="Center" />
-                        <TextBlock Text="Markdown 또는 HTML 파일을 선택하세요" Margin="0,14,0,0"
+                        <TextBlock Text="Markdown, HTML, TXT 또는 JSON 파일을 선택하세요" Margin="0,14,0,0"
                                    Foreground="{DynamicResource SecondaryTextBrush}" FontSize="14" />
                     </StackPanel>
                 </Grid>
@@ -107,7 +161,7 @@
             <DockPanel Margin="10,0">
                 <TextBlock x:Name="StatusText" Text="준비" VerticalAlignment="Center"
                            Foreground="{DynamicResource SecondaryTextBrush}" FontSize="11" />
-                <TextBlock DockPanel.Dock="Right" Text=".md  .markdown  .html  .htm" VerticalAlignment="Center"
+                <TextBlock DockPanel.Dock="Right" Text=".md  .markdown  .html  .htm  .txt  .json" VerticalAlignment="Center"
                            Foreground="{DynamicResource SecondaryTextBrush}" FontSize="11" />
             </DockPanel>
         </Border>
